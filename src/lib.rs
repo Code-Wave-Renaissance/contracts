@@ -1,7 +1,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
-    borsh0_10::try_from_slice_unchecked,
+    borsh1::try_from_slice_unchecked,
     entrypoint,
     entrypoint::ProgramResult,
     msg,
@@ -12,43 +12,33 @@ use solana_program::{
     system_instruction,
     sysvar::{rent::Rent, Sysvar},
 };
-use std::convert::TryInto;
 
 #[derive(BorshDeserialize)]
-pub struct HelloInstructionPayload {
-    pub id: String,
-    pub number: u64,
+pub struct InstructionPayload {
+    pub contract_id: String,
+    pub total_quantity: u64,
 }
 
-pub enum HelloInstruction {
-    Echo { value: String },
-    Square { number: u64 },
-    CreateContract { id: String, totalQuantity: u64 },
-    ShowContract { id: String },
-    Increment { id: String, score: u64 },
+pub enum Instruction {
+    CreateContract { contract_id: String, total_quantity: u64 },
+    IncrementStep { contract_id: String },
 }
 
-impl HelloInstruction {
+impl Instruction {
     pub fn unpack(input: &[u8]) -> Result<Self, ProgramError> {
         let (&variant, rest) = input
             .split_first()
             .ok_or(ProgramError::InvalidInstructionData)?;
 
-        let payload = HelloInstructionPayload::try_from_slice(rest).unwrap();
+        let payload = InstructionPayload::try_from_slice(rest).unwrap();
 
         Ok(match variant {
-            0 => Self::Echo { value: payload.id },
-            1 => Self::Square {
-                number: payload.number,
+            0 => Self::CreateContract {
+                contract_id: payload.contract_id,
+                total_quantity: payload.total_quantity,
             },
-            2 => Self::CreateContract {
-                id: payload.id,
-                totalQuantity: payload.number,
-            },
-            3 => Self::ShowContract { id: payload.id },
-            4 => Self::Increment {
-                id: payload.id,
-                score: payload.number,
+            1 => Self::IncrementStep {
+                contract_id: payload.contract_id
             },
             _ => return Err(ProgramError::InvalidInstructionData),
         })
@@ -56,19 +46,19 @@ impl HelloInstruction {
 }
 
 #[derive(BorshSerialize, BorshDeserialize)]
-pub struct OwnerData {
-    pub id: String,
-    pub Owner: Pubkey,
-    pub Worker: Pubkey,
-    pub TotalQuantity: u64,
-    pub ActualStep: u64,
+pub struct ContractData {
+    pub contract_id: String,
+    pub owner: Pubkey,
+    pub worker: Pubkey,
+    pub total_quantity: u64,
+    pub actual_step: u64,
 }
 
-impl OwnerData {
-    pub fn get_account_size(id: String) -> usize {
+impl ContractData {
+    pub fn get_account_size(contract_id: String) -> usize {
         return 1
             + 4
-            + id.len()
+            + contract_id.len()
             + (2 * std::mem::size_of::<Pubkey>())
             + (2 * std::mem::size_of::<u64>());
     }
@@ -81,24 +71,14 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
-    let instruction = HelloInstruction::unpack(instruction_data)?;
+    let instruction = Instruction::unpack(instruction_data)?;
 
     match instruction {
-        HelloInstruction::Echo { value } => {
-            msg!(&value);
+        Instruction::CreateContract { contract_id, total_quantity } => {
+            create_contract(program_id, accounts, contract_id, total_quantity)?;
         }
-        HelloInstruction::Square { number } => {
-            let x = number * number;
-            msg!("{}", x);
-        }
-        HelloInstruction::CreateContract { id, totalQuantity } => {
-            create_contract(program_id, accounts, id, totalQuantity)?;
-        }
-        HelloInstruction::ShowContract { id } => {
-            show_contract(program_id, accounts, id)?;
-        }
-        HelloInstruction::Increment { id, score } => {
-            increment_worker(program_id, accounts, id, score)?;
+        Instruction::IncrementStep { contract_id } => {
+            increment_step(program_id, accounts, contract_id)?;
         }
     }
 
@@ -108,11 +88,11 @@ pub fn process_instruction(
 fn create_contract(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    id: String,
-    totalQuantity: u64,
+    contract_id: String,
+    total_quantity: u64,
 ) -> ProgramResult {
-    msg!("Received id: {}", id);
-    msg!("Received quantity: {}", totalQuantity);
+    msg!("Received contract_id: {}", contract_id);
+    msg!("Received quantity: {}", total_quantity);
 
     let account_info_iter = &mut accounts.iter();
 
@@ -122,7 +102,7 @@ fn create_contract(
     let system_program = next_account_info(account_info_iter)?;
 
     msg!("Owner balance: {}", sender.lamports());
-    if totalQuantity > sender.lamports() {
+    if total_quantity > sender.lamports() {
         return Err(ProgramError::InsufficientFunds);
     }
 
@@ -130,7 +110,7 @@ fn create_contract(
         &[
             sender.key.as_ref(),
             worker.key.as_ref(),
-            id.as_bytes().as_ref(),
+            contract_id.as_bytes().as_ref(),
         ],
         program_id,
     );
@@ -139,7 +119,7 @@ fn create_contract(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let account_len = OwnerData::get_account_size(id.clone());
+    let account_len = ContractData::get_account_size(contract_id.clone());
     let rent = Rent::get()?;
     let rent_lamports = rent.minimum_balance(account_len);
 
@@ -159,81 +139,48 @@ fn create_contract(
         &[&[
             sender.key.as_ref(),
             worker.key.as_ref(),
-            id.as_bytes().as_ref(),
+            contract_id.as_bytes().as_ref(),
             &[bump_seed],
         ]],
     )?;
 
     invoke(
-        &system_instruction::transfer(sender.key, pda_account.key, totalQuantity),
+        &system_instruction::transfer(sender.key, pda_account.key, total_quantity),
         &[sender.clone(), pda_account.clone(), system_program.clone()],
     )?;
 
     msg!("PDA create - {}", pda_account_key);
 
     let mut account_data =
-        try_from_slice_unchecked::<OwnerData>(&pda_account.data.borrow()).unwrap();
+        try_from_slice_unchecked::<ContractData>(&pda_account.data.borrow()).unwrap();
 
-    account_data.id = id;
-    account_data.Owner = sender.key.clone();
-    account_data.Worker = worker.key.clone();
-    account_data.TotalQuantity = totalQuantity;
-    account_data.ActualStep = 0;
+    account_data.contract_id = contract_id;
+    account_data.owner = sender.key.clone();
+    account_data.worker = worker.key.clone();
+    account_data.total_quantity = total_quantity;
+    account_data.actual_step = 0;
 
     account_data.serialize(&mut &mut pda_account.data.borrow_mut()[..])?;
 
     Ok(())
 }
 
-fn show_contract(program_id: &Pubkey, accounts: &[AccountInfo], id: String) -> ProgramResult {
-    let account_info_iter = &mut accounts.iter();
-
-    let sender = next_account_info(account_info_iter)?;
-    let worker = next_account_info(account_info_iter)?;
-    let pda_account = next_account_info(account_info_iter)?;
-
-    let (pda_account_key, bump_seed) = Pubkey::find_program_address(
-        &[
-            sender.key.as_ref(),
-            worker.key.as_ref(),
-            id.as_bytes().as_ref(),
-        ],
-        program_id,
-    );
-
-    if *pda_account.key != pda_account_key {
-        return Err(ProgramError::InvalidAccountData);
-    }
-
-    let account_data = try_from_slice_unchecked::<OwnerData>(&pda_account.data.borrow()).unwrap();
-
-    msg!("Contract id: {}", account_data.id);
-    msg!("Owner pubkey: {}", account_data.Owner);
-    msg!("Worker pubkey: {}", account_data.Worker);
-    msg!("Total quantity: {}", account_data.TotalQuantity);
-    msg!("Actual Step: {}", account_data.ActualStep);
-
-    Ok(())
-}
-
-fn increment_worker(
+fn increment_step(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
-    id: String,
-    score: u64,
+    contract_id: String
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
 
     let sender = next_account_info(account_info_iter)?;
     let worker = next_account_info(account_info_iter)?;
     let pda_contract = next_account_info(account_info_iter)?;
-    let system_program = next_account_info(account_info_iter)?;
 
-    let (pda_contract_key, bump_seed_contract) = Pubkey::find_program_address(
+    let (pda_contract_key, _bump_seed_contract) = Pubkey::find_program_address(
         &[
             sender.key.as_ref(),
             worker.key.as_ref(),
-            id.as_bytes().as_ref(),
+            contract_id.as_bytes().as_ref(),
         ],
         program_id,
     );
@@ -243,14 +190,14 @@ fn increment_worker(
     }
 
     let mut account_data =
-        try_from_slice_unchecked::<OwnerData>(&pda_contract.data.borrow()).unwrap();
+        try_from_slice_unchecked::<ContractData>(&pda_contract.data.borrow())
+        .unwrap();
 
-    let toTransfer: u64 = match account_data.ActualStep {
-        0 => account_data.TotalQuantity / 3,
-        1 => account_data.TotalQuantity / 3,
+    let transfer_amount: u64 = match account_data.actual_step {
+        0 | 1 => account_data.total_quantity / 3,
         2 => {
-            let quantityPerThree = account_data.TotalQuantity / 3;
-            account_data.TotalQuantity - quantityPerThree - quantityPerThree
+            let quantity_per_three = account_data.total_quantity / 3;
+            account_data.total_quantity - quantity_per_three - quantity_per_three
         }
         _ => {
             msg!("Actual Step Invalid");
@@ -261,16 +208,16 @@ fn increment_worker(
     let pda_initial_amount = pda_contract.lamports();
     let worker_initial_amount = worker.lamports();
 
-    **worker.lamports.borrow_mut() = worker_initial_amount + toTransfer;
-    **pda_contract.lamports.borrow_mut() = pda_initial_amount - toTransfer;
+    **worker.lamports.borrow_mut() = worker_initial_amount + transfer_amount;
+    **pda_contract.lamports.borrow_mut() = pda_initial_amount - transfer_amount;
 
     msg!(
         "{} lamports transferred from contract to {}",
-        toTransfer,
+        transfer_amount,
         worker.key
     );
 
-    account_data.ActualStep = account_data.ActualStep + 1;
+    account_data.actual_step = account_data.actual_step + 1;
 
     account_data.serialize(&mut &mut pda_contract.data.borrow_mut()[..])?;
 
