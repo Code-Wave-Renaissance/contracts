@@ -21,4 +21,8 @@ const contractData = await getContractData(
   id
 );
 
-console.log(`Contract Data: ` + contractData);
+console.log(`ContractId: ` + contractData.contractId);
+console.log(`Owner: ` + contractData.owner);
+console.log(`Worker: ` + contractData.worker);
+console.log(`Total Quantity: ` + contractData.totalQuantity);
+console.log(`Actual Step: ` + contractData.actualStep);

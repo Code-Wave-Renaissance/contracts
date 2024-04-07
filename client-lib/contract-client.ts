@@ -6,18 +6,18 @@ import {
   } from "@solana/web3.js";
   import * as borsh from 'borsh';
 
-  type ContractData = {
+  export type ContractData = {
     contractId: String
-    owner: String
-    worker: String
+    owner: PublicKey
+    worker: PublicKey
     totalQuantity: Number
     actualStep: Number
   }
 
   const contractDataSchema = { struct: {
     contract_id: 'string',
-    owner: 'string',
-    worker: 'string',
+    owner: { array: { type: 'u8', len: 32 } },
+    worker: { array: { type: 'u8', len: 32 } },
     total_quantity: 'u64',
     actual_step: 'u64',
   }};
@@ -26,8 +26,6 @@ import {
     variant: 'u8', contract_id: 'string', total_quantity: 'u64'
   }};
   
-
-
   const programId = new PublicKey("D1JKf9t3tEBzP7jES8bUzCQdLSYSqfcJ2S558AbQruJm");
 
   export function createContract(
@@ -108,28 +106,24 @@ import {
   ): Promise<ContractData> {
     
     const pda = getPda(owner, worker, contractId);
-    return connection.getAccountInfo(programId).then(account => {
+    return connection.getAccountInfo(pda).then(account => {
         if (account != null)
         {
             const data = borsh.deserialize(contractDataSchema, account.data);
-            console.log(data);
             
+            const owner: Uint8Array = data?.valueOf()["owner"];
+            const worker: Uint8Array = data?.valueOf()["worker"];
+
             return {
-                contractId: "",
-                owner: "",
-                worker: "",
-                totalQuantity: 0,
-                actualStep: 0,
+                contractId: data?.valueOf()["contract_id"],
+                owner: new PublicKey(owner),
+                worker: new PublicKey(worker),
+                totalQuantity: data?.valueOf()["total_quantity"],
+                actualStep: data?.valueOf()["actual_step"],
             };
         }
         
-        return {
-          contractId: "",
-          owner: "",
-          worker: "",
-          totalQuantity: 0,
-          actualStep: 0,
-        };
+        throw new Error("Contract not found");
     });
   }
 
