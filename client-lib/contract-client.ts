@@ -85,7 +85,7 @@ import {
             {
               pubkey: worker,
               isSigner:false,
-              isWritable: false
+              isWritable: true
             },
             {
               pubkey: pda,
