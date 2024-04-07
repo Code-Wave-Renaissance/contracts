@@ -91,8 +91,6 @@ fn create_contract(
     contract_id: String,
     total_quantity: u64,
 ) -> ProgramResult {
-    msg!("Received contract_id: {}", contract_id);
-    msg!("Received quantity: {}", total_quantity);
 
     let account_info_iter = &mut accounts.iter();
 
@@ -101,7 +99,6 @@ fn create_contract(
     let pda_account = next_account_info(account_info_iter)?;
     let system_program = next_account_info(account_info_iter)?;
 
-    msg!("Owner balance: {}", sender.lamports());
     if total_quantity > sender.lamports() {
         return Err(ProgramError::InsufficientFunds);
     }
@@ -122,10 +119,6 @@ fn create_contract(
     let account_len = ContractData::get_account_size(contract_id.clone());
     let rent = Rent::get()?;
     let rent_lamports = rent.minimum_balance(account_len);
-
-    msg!("Account Len: {}", account_len);
-    msg!("Rent: {}", rent_lamports);
-    msg!("Creating PDA");
 
     invoke_signed(
         &system_instruction::create_account(
@@ -193,17 +186,16 @@ fn increment_step(
         try_from_slice_unchecked::<ContractData>(&pda_contract.data.borrow())
         .unwrap();
 
-    let transfer_amount: u64 = match account_data.actual_step {
-        0 | 1 => account_data.total_quantity / 3,
+    let transfer_amount = match account_data.actual_step {
+        0 | 1 => Ok(account_data.total_quantity / 3),
         2 => {
             let quantity_per_three = account_data.total_quantity / 3;
-            account_data.total_quantity - quantity_per_three - quantity_per_three
+            Ok(account_data.total_quantity - quantity_per_three - quantity_per_three)
         }
         _ => {
-            msg!("Actual Step Invalid");
-            0
+            Err(ProgramError::InsufficientFunds)
         }
-    };
+    }?;
 
     let pda_initial_amount = pda_contract.lamports();
     let worker_initial_amount = worker.lamports();
