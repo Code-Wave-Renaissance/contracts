@@ -2,11 +2,10 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     borsh1::try_from_slice_unchecked,
-    entrypoint,
     entrypoint::ProgramResult,
+    entrypoint,
     msg,
-    program::invoke,
-    program::invoke_signed,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
     pubkey::Pubkey,
     system_instruction,
@@ -32,16 +31,18 @@ impl Instruction {
 
         let payload = InstructionPayload::try_from_slice(rest).unwrap();
 
-        Ok(match variant {
-            0 => Self::CreateContract {
-                contract_id: payload.contract_id,
-                total_quantity: payload.total_quantity,
-            },
-            1 => Self::IncrementStep {
-                contract_id: payload.contract_id
-            },
+        match variant {
+            0 => Ok(
+                Self::CreateContract {
+                    contract_id: payload.contract_id,
+                    total_quantity: payload.total_quantity,
+                }
+            ),
+            1 => Ok(
+                Self::IncrementStep { contract_id: payload.contract_id }
+            ),
             _ => return Err(ProgramError::InvalidInstructionData),
-        })
+        }
     }
 }
 
@@ -55,12 +56,18 @@ pub struct ContractData {
 }
 
 impl ContractData {
-    pub fn get_account_size(contract_id: String) -> usize {
-        return 1
+    pub fn get_account_size_and_rent(contract_id: String) -> Result<(usize, u64), ProgramError> {
+        let account_len =
+            1
             + 4
             + contract_id.len()
             + (2 * std::mem::size_of::<Pubkey>())
             + (2 * std::mem::size_of::<u64>());
+
+        let rent = Rent::get()?;
+        let rent_lamports = rent.minimum_balance(account_len);
+
+        Ok((account_len, rent_lamports))
     }
 }
 
@@ -75,17 +82,15 @@ pub fn process_instruction(
 
     match instruction {
         Instruction::CreateContract { contract_id, total_quantity } => {
-            create_contract(program_id, accounts, contract_id, total_quantity)?;
+            create_contract_handler(program_id, accounts, contract_id, total_quantity)
         }
         Instruction::IncrementStep { contract_id } => {
-            increment_step(program_id, accounts, contract_id)?;
+            increment_step_handler(program_id, accounts, contract_id)
         }
     }
-
-    Ok(())
 }
 
-fn create_contract(
+fn create_contract_handler(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     contract_id: String,
@@ -94,43 +99,63 @@ fn create_contract(
 
     let account_info_iter = &mut accounts.iter();
 
-    let sender = next_account_info(account_info_iter)?;
+    let owner = next_account_info(account_info_iter)?;
     let worker = next_account_info(account_info_iter)?;
-    let pda_account = next_account_info(account_info_iter)?;
+    let pda = next_account_info(account_info_iter)?;
     let system_program = next_account_info(account_info_iter)?;
 
-    if total_quantity > sender.lamports() {
+    if total_quantity > owner.lamports() {
         return Err(ProgramError::InsufficientFunds);
     }
 
-    let (pda_account_key, bump_seed) = Pubkey::find_program_address(
+    let (pda_key, bump_seed) = Pubkey::find_program_address(
         &[
-            sender.key.as_ref(),
+            owner.key.as_ref(),
             worker.key.as_ref(),
             contract_id.as_bytes().as_ref(),
         ],
         program_id,
     );
 
-    if *pda_account.key != pda_account_key {
-        return Err(ProgramError::InvalidAccountData);
-    }
+    validate_accounts_on_creation(owner, pda, &pda_key)?;
 
-    let account_len = ContractData::get_account_size(contract_id.clone());
-    let rent = Rent::get()?;
-    let rent_lamports = rent.minimum_balance(account_len);
+    create_contract(
+        program_id,
+        owner,
+        worker,
+        pda,
+        system_program,
+        bump_seed,
+        contract_id,
+        total_quantity
+    )
+}
+
+fn create_contract<'a>(
+    program_id: &Pubkey,
+    owner: &AccountInfo<'a>,
+    worker: &AccountInfo<'a>,
+    pda: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    bump_seed: u8,
+    contract_id: String,
+    total_quantity: u64
+) -> ProgramResult {
+
+    let (account_len, rent_lamports) =
+        ContractData::get_account_size_and_rent(contract_id.clone())?;
 
     invoke_signed(
         &system_instruction::create_account(
-            sender.key,
-            pda_account.key,
+            owner.key,
+            pda.key,
             rent_lamports,
             account_len.try_into().unwrap(),
             program_id,
         ),
-        &[sender.clone(), pda_account.clone(), system_program.clone()],
+        &[owner.clone(), pda.clone(), system_program.clone()],
         &[&[
-            sender.key.as_ref(),
+            owner.key.as_ref(),
             worker.key.as_ref(),
             contract_id.as_bytes().as_ref(),
             &[bump_seed],
@@ -138,80 +163,121 @@ fn create_contract(
     )?;
 
     invoke(
-        &system_instruction::transfer(sender.key, pda_account.key, total_quantity),
-        &[sender.clone(), pda_account.clone(), system_program.clone()],
+        &system_instruction::transfer(owner.key, pda.key, total_quantity),
+        &[owner.clone(), pda.clone(), system_program.clone()],
     )?;
 
-    msg!("PDA create - {}", pda_account_key);
+    let mut contract_data =
+        try_from_slice_unchecked::<ContractData>(&pda.data.borrow())?;
 
-    let mut account_data =
-        try_from_slice_unchecked::<ContractData>(&pda_account.data.borrow()).unwrap();
+    contract_data.contract_id = contract_id;
+    contract_data.owner = owner.key.clone();
+    contract_data.worker = worker.key.clone();
+    contract_data.total_quantity = total_quantity;
+    contract_data.actual_step = 0;
 
-    account_data.contract_id = contract_id;
-    account_data.owner = sender.key.clone();
-    account_data.worker = worker.key.clone();
-    account_data.total_quantity = total_quantity;
-    account_data.actual_step = 0;
+    contract_data.serialize(&mut &mut pda.data.borrow_mut()[..])?;
 
-    account_data.serialize(&mut &mut pda_account.data.borrow_mut()[..])?;
+    msg!("Contract created - {}", pda.key);
 
     Ok(())
 }
 
-fn increment_step(
+fn increment_step_handler(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
     contract_id: String
 ) -> ProgramResult {
     let account_info_iter = &mut accounts.iter();
 
-    let sender = next_account_info(account_info_iter)?;
+    let owner = next_account_info(account_info_iter)?;
     let worker = next_account_info(account_info_iter)?;
-    let pda_contract = next_account_info(account_info_iter)?;
+    let pda = next_account_info(account_info_iter)?;
 
-    let (pda_contract_key, _bump_seed_contract) = Pubkey::find_program_address(
+    let (pda_key, _bump_seed) = Pubkey::find_program_address(
         &[
-            sender.key.as_ref(),
+            owner.key.as_ref(),
             worker.key.as_ref(),
             contract_id.as_bytes().as_ref(),
         ],
         program_id,
     );
 
-    if *pda_contract.key != pda_contract_key {
+    validate_accounts_on_increment_step(program_id, owner, pda, &pda_key)?;
+    increment_step(worker, pda)
+}
+
+fn increment_step(worker: &AccountInfo, pda: &AccountInfo) -> ProgramResult {
+    
+    let mut contract_data =
+        try_from_slice_unchecked::<ContractData>(&pda.data.borrow())?;
+
+    let transfer_amount = get_transfer_amount(contract_data.total_quantity, contract_data.actual_step)?;
+
+    **worker.lamports.borrow_mut() = worker.lamports()
+        .checked_add(transfer_amount)
+        .ok_or(ProgramError::InsufficientFunds)?;
+
+    **pda.lamports.borrow_mut() = pda.lamports()
+        .checked_sub(transfer_amount)
+        .ok_or(ProgramError::InsufficientFunds)?;
+
+    msg!("{} lamports transferred from contract to {}", transfer_amount, worker.key);
+
+    contract_data.actual_step += 1;
+    contract_data.serialize(&mut &mut pda.data.borrow_mut()[..])?;
+
+    Ok(())
+}
+
+fn validate_accounts_on_creation(
+    owner: &AccountInfo,
+    pda: &AccountInfo,
+    pda_key: &Pubkey
+) -> ProgramResult {
+
+    if pda.key != pda_key {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    let mut account_data =
-        try_from_slice_unchecked::<ContractData>(&pda_contract.data.borrow())
-        .unwrap();
+    if !owner.is_signer {
+        return Err(ProgramError::IllegalOwner);
+    }
 
-    let transfer_amount = match account_data.actual_step {
-        0 | 1 => Ok(account_data.total_quantity / 3),
+    Ok(())
+}
+
+fn validate_accounts_on_increment_step(
+    program_id: &Pubkey,
+    owner: &AccountInfo,
+    pda: &AccountInfo,
+    pda_key: &Pubkey
+) -> ProgramResult {
+
+    if pda.key != pda_key {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if pda.owner != program_id {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    if !owner.is_signer {
+        return Err(ProgramError::IllegalOwner);
+    }
+
+    Ok(())
+}
+
+fn get_transfer_amount(total_quantity: u64, actual_step: u64) -> Result<u64, ProgramError> {
+    match actual_step {
+        0 | 1 => Ok(total_quantity / 3),
         2 => {
-            let quantity_per_three = account_data.total_quantity / 3;
-            Ok(account_data.total_quantity - quantity_per_three - quantity_per_three)
+            let quantity_per_three = total_quantity / 3;
+            Ok(total_quantity - quantity_per_three - quantity_per_three)
         }
         _ => {
             Err(ProgramError::InsufficientFunds)
         }
-    }?;
-
-    let pda_initial_amount = pda_contract.lamports();
-    let worker_initial_amount = worker.lamports();
-
-    **worker.lamports.borrow_mut() = worker_initial_amount + transfer_amount;
-    **pda_contract.lamports.borrow_mut() = pda_initial_amount - transfer_amount;
-
-    msg!(
-        "{} lamports transferred from contract to {}",
-        transfer_amount,
-        worker.key
-    );
-
-    account_data.actual_step = account_data.actual_step + 1;
-
-    account_data.serialize(&mut &mut pda_contract.data.borrow_mut()[..])?;
-
-    Ok(())
+    }
 }
